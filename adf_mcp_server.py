@@ -117,6 +117,7 @@ async def _run_az(az_args: list[str], timeout: int = _AZ_TIMEOUT) -> tuple[int, 
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=os.environ.copy(),
