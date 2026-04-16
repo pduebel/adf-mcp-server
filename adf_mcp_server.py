@@ -379,8 +379,13 @@ async def _delete_adf_resource(
     resource_name: str,
     resource_label: str,
     tool_name: str,
+    confirm_flag: bool = True,
 ) -> dict:
-    """Generic delete for any ADF resource (pipeline, linked-service, dataset)."""
+    """Generic delete for any ADF resource (pipeline, linked-service, dataset).
+
+    Set confirm_flag=False for resource types whose CLI delete command does not
+    accept --yes (e.g. data-flow).
+    """
     if err := _check_config():
         return {**err, "tool": tool_name}
     if not resource_name:
@@ -390,7 +395,7 @@ async def _delete_adf_resource(
         *az_subcommand, "delete",
         *_base_flags(),
         "--name", resource_name,
-        "--yes",
+        *( ["--yes"] if confirm_flag else [] ),
         "--only-show-errors",
     ]
     rc, _, stderr = await _run_az(cmd)
@@ -516,7 +521,8 @@ async def _create_or_update_dataflow(args: dict) -> dict:
 
 async def _delete_dataflow(args: dict) -> dict:
     return await _delete_adf_resource(
-        ["datafactory", "data-flow"], args.get("dataflow_name", "").strip(), "data flow", "delete_dataflow"
+        ["datafactory", "data-flow"], args.get("dataflow_name", "").strip(), "data flow", "delete_dataflow",
+        confirm_flag=False,
     )
 
 
