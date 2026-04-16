@@ -11,6 +11,9 @@ Tools:
   create_or_update_pipeline      — create or upsert a pipeline definition
   create_or_update_linked_service — create or upsert a linked service definition
   create_or_update_dataset       — create or upsert a dataset definition
+  delete_pipeline                — delete a pipeline by name
+  delete_linked_service          — delete a linked service by name
+  delete_dataset                 — delete a dataset by name
   trigger_pipeline_run           — start a pipeline run and return the run ID
   get_pipeline_run_status        — check the status of a run by run ID
   get_activity_run_logs          — fetch per-activity logs for a run
@@ -332,6 +335,56 @@ async def _upsert_adf_resource(
         "stderr": stderr,
         "tool": tool_name,
     }
+
+
+# ── delete helper ────────────────────────────────────────────────────────────
+
+async def _delete_adf_resource(
+    az_subcommand: list[str],
+    resource_name: str,
+    resource_label: str,
+    tool_name: str,
+) -> dict:
+    """Generic delete for any ADF resource (pipeline, linked-service, dataset)."""
+    if err := _check_config():
+        return {**err, "tool": tool_name}
+    if not resource_name:
+        return {"success": False, "error": f"{resource_label}_name is required.", "stderr": "", "tool": tool_name}
+
+    cmd = [
+        *az_subcommand, "delete",
+        *_base_flags(),
+        "--name", resource_name,
+        "--yes",
+        "--only-show-errors",
+    ]
+    rc, _, stderr = await _run_az(cmd)
+    if rc != 0:
+        return {
+            "success": False,
+            "error": f"Failed to delete {resource_label} '{resource_name}'.",
+            "stderr": stderr,
+            "tool": tool_name,
+        }
+    return {"success": True, "action": "deleted", "name": resource_name, "tool": tool_name}
+
+
+async def _delete_pipeline(args: dict) -> dict:
+    return await _delete_adf_resource(
+        ["datafactory", "pipeline"], args.get("pipeline_name", "").strip(), "pipeline", "delete_pipeline"
+    )
+
+
+async def _delete_linked_service(args: dict) -> dict:
+    return await _delete_adf_resource(
+        ["datafactory", "linked-service"], args.get("linked_service_name", "").strip(), "linked_service", "delete_linked_service"
+    )
+
+
+async def _delete_dataset(args: dict) -> dict:
+    return await _delete_adf_resource(
+        ["datafactory", "dataset"], args.get("dataset_name", "").strip(), "dataset", "delete_dataset"
+    )
 
 
 # ── Tool 1: create_or_update_pipeline ────────────────────────────────────────
@@ -712,6 +765,39 @@ async def handle_list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="delete_pipeline",
+            description="Permanently delete an ADF pipeline by name. This action cannot be undone.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pipeline_name": {"type": "string", "description": "Name of the pipeline to delete."},
+                },
+                "required": ["pipeline_name"],
+            },
+        ),
+        types.Tool(
+            name="delete_linked_service",
+            description="Permanently delete an ADF linked service by name. This action cannot be undone.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "linked_service_name": {"type": "string", "description": "Name of the linked service to delete."},
+                },
+                "required": ["linked_service_name"],
+            },
+        ),
+        types.Tool(
+            name="delete_dataset",
+            description="Permanently delete an ADF dataset by name. This action cannot be undone.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "dataset_name": {"type": "string", "description": "Name of the dataset to delete."},
+                },
+                "required": ["dataset_name"],
+            },
+        ),
+        types.Tool(
             name="trigger_pipeline_run",
             description=(
                 "Trigger a named ADF pipeline and return the run ID. "
@@ -795,6 +881,9 @@ async def handle_call_tool(
         "create_or_update_pipeline": _create_or_update_pipeline,
         "create_or_update_linked_service": _create_or_update_linked_service,
         "create_or_update_dataset": _create_or_update_dataset,
+        "delete_pipeline": _delete_pipeline,
+        "delete_linked_service": _delete_linked_service,
+        "delete_dataset": _delete_dataset,
         "trigger_pipeline_run": _trigger_pipeline_run,
         "get_pipeline_run_status": _get_pipeline_run_status,
         "get_activity_run_logs": _get_activity_run_logs,
