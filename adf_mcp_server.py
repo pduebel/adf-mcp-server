@@ -14,6 +14,9 @@ Tools:
   delete_pipeline                — delete a pipeline by name
   delete_linked_service          — delete a linked service by name
   delete_dataset                 — delete a dataset by name
+  list_dataflows                 — list all data flows in the factory
+  create_or_update_dataflow      — create or update a data flow definition
+  delete_dataflow                — delete a data flow by name
   trigger_pipeline_run           — start a pipeline run and return the run ID
   get_pipeline_run_status        — check the status of a run by run ID
   get_activity_run_logs          — fetch per-activity logs for a run
@@ -29,6 +32,7 @@ import os
 import platform
 import shutil
 import sys
+import tempfile
 from datetime import datetime, timezone
 
 import mcp.types as types
@@ -279,62 +283,93 @@ async def _upsert_adf_resource(
     json_flag     : CLI flag for the resource body, e.g. "--pipeline"
     az_arg        : the value for json_flag (compact JSON string or @filepath)
     tool_name     : included in error dicts for caller context
+
+    If az_arg is an inline JSON string (not already a @file reference), it is
+    written to a temporary file and passed as @filepath. This avoids cmd.exe
+    interpreting special characters (parentheses, quotes, etc.) that appear
+    inside ADF expressions when az.cmd is invoked on Windows.
     """
-    create_cmd = [
-        *az_subcommand, "create",
-        *_base_flags(),
-        "--name", resource_name,
-        json_flag, az_arg,
-        "--output", "json",
-        "--only-show-errors",
-    ]
-
-    rc, stdout, stderr = await _run_az(create_cmd)
-
-    if rc == 0:
+    tmp_path: str | None = None
+    if not az_arg.startswith("@"):
         try:
-            obj = json.loads(stdout) if stdout else {}
-        except json.JSONDecodeError:
-            obj = {"raw": stdout}
-        return {"success": True, "action": "created", "name": resource_name, "resource": obj, "tool": tool_name}
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False, encoding="utf-8"
+            ) as tmp:
+                tmp.write(az_arg)
+                tmp_path = tmp.name
+            effective_az_arg = f"@{tmp_path}"
+        except OSError as exc:
+            return {
+                "success": False,
+                "error": f"Failed to write temporary JSON file: {exc}",
+                "stderr": "",
+                "tool": tool_name,
+            }
+    else:
+        effective_az_arg = az_arg
 
-    if "alreadyexists" in stderr.lower() or "already exists" in stderr.lower():
-        delete_cmd = [
-            *az_subcommand, "delete",
+    try:
+        create_cmd = [
+            *az_subcommand, "create",
             *_base_flags(),
             "--name", resource_name,
-            "--yes",
+            json_flag, effective_az_arg,
+            "--output", "json",
             "--only-show-errors",
         ]
-        del_rc, _, del_stderr = await _run_az(delete_cmd)
-        if del_rc != 0:
-            return {
-                "success": False,
-                "error": f"Failed to delete existing '{resource_name}' before update.",
-                "stderr": del_stderr,
-                "tool": tool_name,
-            }
 
-        rc2, stdout2, stderr2 = await _run_az(create_cmd)
-        if rc2 != 0:
-            return {
-                "success": False,
-                "error": f"Failed to re-create '{resource_name}' after delete.",
-                "stderr": stderr2,
-                "tool": tool_name,
-            }
-        try:
-            obj = json.loads(stdout2) if stdout2 else {}
-        except json.JSONDecodeError:
-            obj = {"raw": stdout2}
-        return {"success": True, "action": "updated", "name": resource_name, "resource": obj, "tool": tool_name}
+        rc, stdout, stderr = await _run_az(create_cmd)
 
-    return {
-        "success": False,
-        "error": f"Failed to create '{resource_name}'.",
-        "stderr": stderr,
-        "tool": tool_name,
-    }
+        if rc == 0:
+            try:
+                obj = json.loads(stdout) if stdout else {}
+            except json.JSONDecodeError:
+                obj = {"raw": stdout}
+            return {"success": True, "action": "created", "name": resource_name, "resource": obj, "tool": tool_name}
+
+        if "alreadyexists" in stderr.lower() or "already exists" in stderr.lower():
+            delete_cmd = [
+                *az_subcommand, "delete",
+                *_base_flags(),
+                "--name", resource_name,
+                "--yes",
+                "--only-show-errors",
+            ]
+            del_rc, _, del_stderr = await _run_az(delete_cmd)
+            if del_rc != 0:
+                return {
+                    "success": False,
+                    "error": f"Failed to delete existing '{resource_name}' before update.",
+                    "stderr": del_stderr,
+                    "tool": tool_name,
+                }
+
+            rc2, stdout2, stderr2 = await _run_az(create_cmd)
+            if rc2 != 0:
+                return {
+                    "success": False,
+                    "error": f"Failed to re-create '{resource_name}' after delete.",
+                    "stderr": stderr2,
+                    "tool": tool_name,
+                }
+            try:
+                obj = json.loads(stdout2) if stdout2 else {}
+            except json.JSONDecodeError:
+                obj = {"raw": stdout2}
+            return {"success": True, "action": "updated", "name": resource_name, "resource": obj, "tool": tool_name}
+
+        return {
+            "success": False,
+            "error": f"Failed to create '{resource_name}'.",
+            "stderr": stderr,
+            "tool": tool_name,
+        }
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 # ── delete helper ────────────────────────────────────────────────────────────
@@ -387,6 +422,104 @@ async def _delete_dataset(args: dict) -> dict:
     )
 
 
+# ── dataflow helpers ──────────────────────────────────────────────────────────
+
+async def _list_dataflows(_args: dict) -> dict:
+    return await _list_adf_resources(["datafactory", "data-flow"], "data flows", "list_dataflows")
+
+
+async def _create_or_update_dataflow(args: dict) -> dict:
+    """
+    Upsert a data flow. Unlike pipelines/linked-services/datasets the az CLI
+    provides a native 'update' command for data flows, so we use create→update
+    rather than the delete+recreate pattern. 'create' also requires --flow-type
+    which 'update' does not accept.
+    """
+    if err := _check_config():
+        return {**err, "tool": "create_or_update_dataflow"}
+
+    name: str = args.get("dataflow_name", "").strip()
+    definition: str = args.get("dataflow_definition", "").strip()
+    flow_type: str = args.get("flow_type", "MappingDataFlow").strip()
+
+    if not name:
+        return {"success": False, "error": "dataflow_name is required.", "stderr": "", "tool": "create_or_update_dataflow"}
+    if not definition:
+        return {"success": False, "error": "dataflow_definition is required.", "stderr": "", "tool": "create_or_update_dataflow"}
+    if flow_type not in ("MappingDataFlow", "Flowlet"):
+        return {"success": False, "error": "flow_type must be 'MappingDataFlow' or 'Flowlet'.", "stderr": "", "tool": "create_or_update_dataflow"}
+
+    az_arg, err = _resolve_resource_json(definition, "dataflow_definition")
+    if err:
+        return {**err, "tool": "create_or_update_dataflow"}
+
+    # Write inline JSON to a temp file to avoid cmd.exe shell-escaping issues.
+    tmp_path: str | None = None
+    if not az_arg.startswith("@"):
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", delete=False, encoding="utf-8"
+            ) as tmp:
+                tmp.write(az_arg)
+                tmp_path = tmp.name
+            effective_az_arg = f"@{tmp_path}"
+        except OSError as exc:
+            return {"success": False, "error": f"Failed to write temporary JSON file: {exc}", "stderr": "", "tool": "create_or_update_dataflow"}
+    else:
+        effective_az_arg = az_arg
+
+    try:
+        create_cmd = [
+            "datafactory", "data-flow", "create",
+            *_base_flags(),
+            "--data-flow-name", name,
+            "--flow-type", flow_type,
+            "--properties", effective_az_arg,
+            "--output", "json",
+            "--only-show-errors",
+        ]
+        rc, stdout, stderr = await _run_az(create_cmd)
+
+        if rc == 0:
+            try:
+                obj = json.loads(stdout) if stdout else {}
+            except json.JSONDecodeError:
+                obj = {"raw": stdout}
+            return {"success": True, "action": "created", "name": name, "resource": obj, "tool": "create_or_update_dataflow"}
+
+        if "alreadyexists" in stderr.lower() or "already exists" in stderr.lower():
+            update_cmd = [
+                "datafactory", "data-flow", "update",
+                *_base_flags(),
+                "--data-flow-name", name,
+                "--properties", effective_az_arg,
+                "--output", "json",
+                "--only-show-errors",
+            ]
+            rc2, stdout2, stderr2 = await _run_az(update_cmd)
+            if rc2 != 0:
+                return {"success": False, "error": f"Failed to update data flow '{name}'.", "stderr": stderr2, "tool": "create_or_update_dataflow"}
+            try:
+                obj = json.loads(stdout2) if stdout2 else {}
+            except json.JSONDecodeError:
+                obj = {"raw": stdout2}
+            return {"success": True, "action": "updated", "name": name, "resource": obj, "tool": "create_or_update_dataflow"}
+
+        return {"success": False, "error": f"Failed to create data flow '{name}'.", "stderr": stderr, "tool": "create_or_update_dataflow"}
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+async def _delete_dataflow(args: dict) -> dict:
+    return await _delete_adf_resource(
+        ["datafactory", "data-flow"], args.get("dataflow_name", "").strip(), "data flow", "delete_dataflow"
+    )
+
+
 # ── Tool 1: create_or_update_pipeline ────────────────────────────────────────
 
 async def _create_or_update_pipeline(args: dict) -> dict:
@@ -426,7 +559,7 @@ async def _create_or_update_linked_service(args: dict) -> dict:
     if err:
         return {**err, "tool": "create_or_update_linked_service"}
 
-    return await _upsert_adf_resource(["datafactory", "linked-service"], name, "--linked-service", az_arg, "create_or_update_linked_service")
+    return await _upsert_adf_resource(["datafactory", "linked-service"], name, "--properties", az_arg, "create_or_update_linked_service")
 
 
 # ── Tool 3: create_or_update_dataset ─────────────────────────────────────────
@@ -447,7 +580,7 @@ async def _create_or_update_dataset(args: dict) -> dict:
     if err:
         return {**err, "tool": "create_or_update_dataset"}
 
-    return await _upsert_adf_resource(["datafactory", "dataset"], name, "--dataset", az_arg, "create_or_update_dataset")
+    return await _upsert_adf_resource(["datafactory", "dataset"], name, "--properties", az_arg, "create_or_update_dataset")
 
 
 # ── Tool 4: trigger_pipeline_run ─────────────────────────────────────────────
@@ -798,6 +931,52 @@ async def handle_list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="list_dataflows",
+            description="List the names of all data flows that exist in the Azure Data Factory.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        types.Tool(
+            name="create_or_update_dataflow",
+            description=(
+                "Create or update an Azure Data Factory data flow. "
+                "Pass the data flow properties as an inline JSON string or an absolute file path. "
+                "If the data flow already exists it will be updated in place."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "dataflow_name": {
+                        "type": "string",
+                        "description": "Name of the ADF data flow to create or update.",
+                    },
+                    "dataflow_definition": {
+                        "type": "string",
+                        "description": (
+                            "Data flow properties JSON as an inline string starting with '{', "
+                            "or an absolute file path to a .json file."
+                        ),
+                    },
+                    "flow_type": {
+                        "type": "string",
+                        "enum": ["MappingDataFlow", "Flowlet"],
+                        "description": "Type of data flow. Only required when creating a new data flow; ignored on update. Defaults to 'MappingDataFlow'.",
+                    },
+                },
+                "required": ["dataflow_name", "dataflow_definition"],
+            },
+        ),
+        types.Tool(
+            name="delete_dataflow",
+            description="Permanently delete an ADF data flow by name. This action cannot be undone.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "dataflow_name": {"type": "string", "description": "Name of the data flow to delete."},
+                },
+                "required": ["dataflow_name"],
+            },
+        ),
+        types.Tool(
             name="trigger_pipeline_run",
             description=(
                 "Trigger a named ADF pipeline and return the run ID. "
@@ -884,6 +1063,9 @@ async def handle_call_tool(
         "delete_pipeline": _delete_pipeline,
         "delete_linked_service": _delete_linked_service,
         "delete_dataset": _delete_dataset,
+        "list_dataflows": _list_dataflows,
+        "create_or_update_dataflow": _create_or_update_dataflow,
+        "delete_dataflow": _delete_dataflow,
         "trigger_pipeline_run": _trigger_pipeline_run,
         "get_pipeline_run_status": _get_pipeline_run_status,
         "get_activity_run_logs": _get_activity_run_logs,
