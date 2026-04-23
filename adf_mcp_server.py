@@ -1,5 +1,5 @@
 """
-adf_mcp_server.py — MCP server exposing Azure Data Factory tools via az CLI.
+adf_mcp_server.py — MCP server exposing Azure Data Factory tools via the Azure Python SDK.
 
 Tools:
   list_pipelines                 — list all pipelines in the factory
@@ -21,21 +21,23 @@ Tools:
   get_pipeline_run_status        — check the status of a run by run ID
   get_activity_run_logs          — fetch per-activity logs for a run
 
-Authentication: ambient az login (no credentials in code).
+Authentication: DefaultAzureCredential (includes az login, env vars, managed identity).
 ADF identity:   ADF_SUBSCRIPTION_ID, ADF_RESOURCE_GROUP, ADF_FACTORY_NAME env vars.
 """
 
 import asyncio
+import functools
 import json
 import logging
 import os
-import platform
-import shutil
 import sys
-import tempfile
 from datetime import datetime, timezone
 
 import mcp.types as types
+from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
+from azure.identity import DefaultAzureCredential
+from azure.mgmt.datafactory import DataFactoryManagementClient
+from azure.mgmt.datafactory.models import RunFilterParameters
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
@@ -71,381 +73,218 @@ def _check_config() -> dict | None:
     return None
 
 
-def _az_exe() -> list[str]:
-    """
-    Return the prefix needed to invoke the Azure CLI on this platform.
+# ── SDK client (lazy singleton) ───────────────────────────────────────────────
 
-    On Windows, 'az' is a .cmd batch file and cannot be executed directly
-    by subprocess without the shell. We use 'cmd /c az' so that Windows can
-    locate and run az.cmd through the normal PATH lookup.
-    On other platforms, 'az' is a regular executable.
-    """
-    if platform.system() == "Windows":
-        # Prefer the full path if we can find it (survives a minimal PATH).
-        az_path = shutil.which("az.cmd") or shutil.which("az")
-        if az_path:
-            return [az_path]
-        # Fall back to letting cmd.exe resolve it.
-        return ["cmd", "/c", "az"]
-    return ["az"]
+_adf_client: DataFactoryManagementClient | None = None
 
 
-def _base_flags() -> list[str]:
-    """Common ADF resource flags shared by every az command."""
-    return [
-        "--subscription", ADF_SUBSCRIPTION_ID,
-        "--resource-group", ADF_RESOURCE_GROUP,
-        "--factory-name", ADF_FACTORY_NAME,
-    ]
-
-
-# ── subprocess helper ─────────────────────────────────────────────────────────
-
-# How long (seconds) to wait for any single az CLI call before giving up.
-# Claude Desktop's tool-call timeout is typically 60–120 s; keeping this below
-# that ensures we return a clean error rather than a silent timeout on the
-# client side.  Upsert operations can involve two sequential az calls
-# (delete + create), so each individual call gets this budget.
-_AZ_TIMEOUT = 90
-
-
-async def _run_az(az_args: list[str], timeout: int = _AZ_TIMEOUT) -> tuple[int, str, str]:
-    """
-    Run an Azure CLI command asynchronously.
-
-    Pass only the arguments after 'az' (e.g. ["datafactory", "pipeline", "list", ...]).
-    The correct executable prefix for the current platform is prepended automatically.
-    Returns (returncode, stdout, stderr). Never raises.
-
-    Uses asyncio.create_subprocess_exec so the event loop is not blocked and
-    the subprocess is properly killed if the timeout fires.
-    """
-    cmd = [*_az_exe(), *az_args]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=os.environ.copy(),
+def _get_client() -> DataFactoryManagementClient:
+    """Return the shared ADF management client, creating it on first call."""
+    global _adf_client
+    if _adf_client is None:
+        _adf_client = DataFactoryManagementClient(
+            DefaultAzureCredential(), ADF_SUBSCRIPTION_ID
         )
+    return _adf_client
+
+
+# ── Async bridge ──────────────────────────────────────────────────────────────
+
+async def _run_sdk(fn, *args, **kwargs):
+    """Run a synchronous SDK call in a thread pool so the event loop is never blocked."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
+
+
+# ── Resource definition helper ────────────────────────────────────────────────
+
+def _resolve_resource_json(definition: str, field_name: str) -> tuple[dict | None, dict | None]:
+    """
+    Parse a resource definition argument into a dict.
+
+    Accepts either:
+      - An inline JSON string starting with '{'
+      - A file path to a .json file
+
+    Returns (body_dict, None) on success, or (None, error_dict) on failure.
+    """
+    value = definition.strip()
+    if value.startswith("{"):
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()
-                await proc.wait()
-            except Exception:
-                pass
-            return -1, "", (
-                f"az command timed out after {timeout}s. "
-                "The operation may have still completed in Azure — verify in the portal."
-            )
-        return proc.returncode, stdout_bytes.decode(errors="replace").strip(), stderr_bytes.decode(errors="replace").strip()
-    except Exception as exc:
-        return -1, "", str(exc)
+            return json.loads(value), None
+        except json.JSONDecodeError as exc:
+            return None, {"success": False, "error": f"{field_name} is not valid JSON: {exc}", "stderr": ""}
+
+    abs_path = os.path.abspath(value)
+    if not os.path.isfile(abs_path):
+        return None, {"success": False, "error": f"{field_name} file not found: {abs_path}", "stderr": ""}
+    try:
+        with open(abs_path, encoding="utf-8") as fh:
+            return json.load(fh), None
+    except json.JSONDecodeError as exc:
+        return None, {"success": False, "error": f"{field_name} file is not valid JSON: {exc}", "stderr": ""}
+
+
+def _sdk_error(exc: HttpResponseError) -> str:
+    """Extract a readable message from an HttpResponseError."""
+    return str(exc.message) if exc.message else str(exc)
 
 
 # ── list / get helpers ────────────────────────────────────────────────────────
 
-async def _list_adf_resources(az_subcommand: list[str], resource_label: str, tool_name: str) -> dict:
-    """Generic list for pipelines, linked-services, or datasets."""
+async def _list_adf_resources(list_fn, resource_label: str, tool_name: str) -> dict:
+    """Generic list for pipelines, linked-services, datasets, or data flows."""
     if err := _check_config():
         return {**err, "tool": tool_name}
-
-    cmd = [*az_subcommand, "list", *_base_flags(), "--output", "json", "--only-show-errors"]
-    rc, stdout, stderr = await _run_az(cmd)
-    if rc != 0:
-        return {"success": False, "error": f"Failed to list {resource_label}.", "stderr": stderr, "tool": tool_name}
-
     try:
-        items = json.loads(stdout) if stdout else []
-    except json.JSONDecodeError:
-        items = []
+        items = await _run_sdk(list_fn, ADF_RESOURCE_GROUP, ADF_FACTORY_NAME)
+        names = [item.name for item in items if item.name]
+        return {"success": True, "count": len(names), "names": names, "tool": tool_name}
+    except HttpResponseError as exc:
+        return {"success": False, "error": f"Failed to list {resource_label}: {_sdk_error(exc)}", "stderr": "", "tool": tool_name}
 
-    names = [item.get("name", "") for item in items if isinstance(item, dict)]
-    return {"success": True, "count": len(names), "names": names, "tool": tool_name}
 
-
-async def _get_adf_resource(az_subcommand: list[str], name: str, resource_label: str, tool_name: str) -> dict:
-    """Generic get (show) for a single pipeline, linked-service, or dataset."""
+async def _get_adf_resource(get_fn, name: str, name_field: str, resource_label: str, tool_name: str) -> dict:
+    """Generic get for a single pipeline, linked-service, or dataset."""
     if err := _check_config():
         return {**err, "tool": tool_name}
     if not name:
-        return {"success": False, "error": f"{resource_label}_name is required.", "stderr": "", "tool": tool_name}
-
-    cmd = [*az_subcommand, "show", *_base_flags(), "--name", name, "--output", "json", "--only-show-errors"]
-    rc, stdout, stderr = await _run_az(cmd)
-    if rc != 0:
-        return {"success": False, "error": f"Failed to get {resource_label} '{name}'.", "stderr": stderr, "tool": tool_name}
-
+        return {"success": False, "error": f"{name_field} is required.", "stderr": "", "tool": tool_name}
     try:
-        resource = json.loads(stdout) if stdout else {}
-    except json.JSONDecodeError:
-        resource = {"raw": stdout}
+        resource = await _run_sdk(get_fn, ADF_RESOURCE_GROUP, ADF_FACTORY_NAME, name)
+        return {"success": True, "name": name, "resource": resource.as_dict(), "tool": tool_name}
+    except ResourceNotFoundError:
+        return {"success": False, "error": f"{resource_label} '{name}' not found.", "stderr": "", "tool": tool_name}
+    except HttpResponseError as exc:
+        return {"success": False, "error": f"Failed to get {resource_label} '{name}': {_sdk_error(exc)}", "stderr": "", "tool": tool_name}
 
-    return {"success": True, "name": name, "resource": resource, "tool": tool_name}
+
+async def _upsert_adf_resource(upsert_fn, name: str, body: dict, resource_label: str, tool_name: str) -> dict:
+    """Generic create-or-update for any ADF resource."""
+    try:
+        result = await _run_sdk(upsert_fn, ADF_RESOURCE_GROUP, ADF_FACTORY_NAME, name, body)
+        return {"success": True, "action": "upserted", "name": name, "resource": result.as_dict(), "tool": tool_name}
+    except HttpResponseError as exc:
+        return {"success": False, "error": f"Failed to create or update {resource_label} '{name}': {_sdk_error(exc)}", "stderr": "", "tool": tool_name}
+
+
+async def _delete_adf_resource(delete_fn, name: str, name_field: str, resource_label: str, tool_name: str) -> dict:
+    """Generic delete for any ADF resource."""
+    if err := _check_config():
+        return {**err, "tool": tool_name}
+    if not name:
+        return {"success": False, "error": f"{name_field} is required.", "stderr": "", "tool": tool_name}
+    try:
+        await _run_sdk(delete_fn, ADF_RESOURCE_GROUP, ADF_FACTORY_NAME, name)
+        return {"success": True, "action": "deleted", "name": name, "tool": tool_name}
+    except ResourceNotFoundError:
+        return {"success": False, "error": f"{resource_label} '{name}' not found.", "stderr": "", "tool": tool_name}
+    except HttpResponseError as exc:
+        return {"success": False, "error": f"Failed to delete {resource_label} '{name}': {_sdk_error(exc)}", "stderr": "", "tool": tool_name}
 
 
 # ── Tool 1–3: list_* ──────────────────────────────────────────────────────────
 
 async def _list_pipelines(_args: dict) -> dict:
-    return await _list_adf_resources(["datafactory", "pipeline"], "pipelines", "list_pipelines")
+    return await _list_adf_resources(_get_client().pipelines.list_by_factory, "pipelines", "list_pipelines")
 
 
 async def _list_linked_services(_args: dict) -> dict:
-    return await _list_adf_resources(["datafactory", "linked-service"], "linked services", "list_linked_services")
+    return await _list_adf_resources(_get_client().linked_services.list_by_factory, "linked services", "list_linked_services")
 
 
 async def _list_datasets(_args: dict) -> dict:
-    return await _list_adf_resources(["datafactory", "dataset"], "datasets", "list_datasets")
+    return await _list_adf_resources(_get_client().datasets.list_by_factory, "datasets", "list_datasets")
 
 
 # ── Tool 4–6: get_* ───────────────────────────────────────────────────────────
 
 async def _get_pipeline(args: dict) -> dict:
     return await _get_adf_resource(
-        ["datafactory", "pipeline"], args.get("pipeline_name", "").strip(), "pipeline", "get_pipeline"
+        _get_client().pipelines.get,
+        args.get("pipeline_name", "").strip(),
+        "pipeline_name", "pipeline", "get_pipeline",
     )
 
 
 async def _get_linked_service(args: dict) -> dict:
     return await _get_adf_resource(
-        ["datafactory", "linked-service"], args.get("linked_service_name", "").strip(), "linked_service", "get_linked_service"
+        _get_client().linked_services.get,
+        args.get("linked_service_name", "").strip(),
+        "linked_service_name", "linked service", "get_linked_service",
     )
 
 
 async def _get_dataset(args: dict) -> dict:
     return await _get_adf_resource(
-        ["datafactory", "dataset"], args.get("dataset_name", "").strip(), "dataset", "get_dataset"
+        _get_client().datasets.get,
+        args.get("dataset_name", "").strip(),
+        "dataset_name", "dataset", "get_dataset",
     )
 
 
-# ── shared resource helpers ───────────────────────────────────────────────────
+# ── Tool 7–10: create_or_update_* ────────────────────────────────────────────
 
-def _resolve_resource_json(definition: str, field_name: str) -> tuple[str | None, dict | None]:
-    """
-    Resolve a resource definition argument to the value for an az --<resource> flag.
-
-    Accepts either:
-      - An inline JSON string starting with '{'
-      - An absolute file path to a .json file (passed as @filepath to az)
-
-    Returns (az_arg, None) on success, or (None, error_dict) on failure.
-    """
-    value = definition.strip()
-
-    if value.startswith("{"):
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError as exc:
-            return None, {
-                "success": False,
-                "error": f"{field_name} is not valid JSON: {exc}",
-                "stderr": "",
-            }
-        return json.dumps(parsed, separators=(",", ":")), None
-
-    abs_path = os.path.abspath(value)
-    if not os.path.isfile(abs_path):
-        return None, {
-            "success": False,
-            "error": f"{field_name} file not found: {abs_path}",
-            "stderr": "",
-        }
-    try:
-        with open(abs_path, encoding="utf-8") as fh:
-            json.load(fh)
-    except json.JSONDecodeError as exc:
-        return None, {
-            "success": False,
-            "error": f"{field_name} file is not valid JSON: {exc}",
-            "stderr": "",
-        }
-    return f"@{abs_path}", None
-
-
-async def _upsert_adf_resource(
-    az_subcommand: list[str],
-    resource_name: str,
-    json_flag: str,
-    az_arg: str,
-    tool_name: str,
-) -> dict:
-    """
-    Generic create-or-upsert for any ADF resource (pipeline, linked-service, dataset).
-
-    az_subcommand : e.g. ["datafactory", "pipeline"]
-    resource_name : display name for error messages
-    json_flag     : CLI flag for the resource body, e.g. "--pipeline"
-    az_arg        : the value for json_flag (compact JSON string or @filepath)
-    tool_name     : included in error dicts for caller context
-
-    If az_arg is an inline JSON string (not already a @file reference), it is
-    written to a temporary file and passed as @filepath. This avoids cmd.exe
-    interpreting special characters (parentheses, quotes, etc.) that appear
-    inside ADF expressions when az.cmd is invoked on Windows.
-    """
-    tmp_path: str | None = None
-    if not az_arg.startswith("@"):
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".json", delete=False, encoding="utf-8"
-            ) as tmp:
-                tmp.write(az_arg)
-                tmp_path = tmp.name
-            effective_az_arg = f"@{tmp_path}"
-        except OSError as exc:
-            return {
-                "success": False,
-                "error": f"Failed to write temporary JSON file: {exc}",
-                "stderr": "",
-                "tool": tool_name,
-            }
-    else:
-        effective_az_arg = az_arg
-
-    try:
-        create_cmd = [
-            *az_subcommand, "create",
-            *_base_flags(),
-            "--name", resource_name,
-            json_flag, effective_az_arg,
-            "--output", "json",
-            "--only-show-errors",
-        ]
-
-        rc, stdout, stderr = await _run_az(create_cmd)
-
-        if rc == 0:
-            try:
-                obj = json.loads(stdout) if stdout else {}
-            except json.JSONDecodeError:
-                obj = {"raw": stdout}
-            return {"success": True, "action": "created", "name": resource_name, "resource": obj, "tool": tool_name}
-
-        if "alreadyexists" in stderr.lower() or "already exists" in stderr.lower():
-            delete_cmd = [
-                *az_subcommand, "delete",
-                *_base_flags(),
-                "--name", resource_name,
-                "--yes",
-                "--only-show-errors",
-            ]
-            del_rc, _, del_stderr = await _run_az(delete_cmd)
-            if del_rc != 0:
-                return {
-                    "success": False,
-                    "error": f"Failed to delete existing '{resource_name}' before update.",
-                    "stderr": del_stderr,
-                    "tool": tool_name,
-                }
-
-            rc2, stdout2, stderr2 = await _run_az(create_cmd)
-            if rc2 != 0:
-                return {
-                    "success": False,
-                    "error": f"Failed to re-create '{resource_name}' after delete.",
-                    "stderr": stderr2,
-                    "tool": tool_name,
-                }
-            try:
-                obj = json.loads(stdout2) if stdout2 else {}
-            except json.JSONDecodeError:
-                obj = {"raw": stdout2}
-            return {"success": True, "action": "updated", "name": resource_name, "resource": obj, "tool": tool_name}
-
-        return {
-            "success": False,
-            "error": f"Failed to create '{resource_name}'.",
-            "stderr": stderr,
-            "tool": tool_name,
-        }
-    finally:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
-
-# ── delete helper ────────────────────────────────────────────────────────────
-
-async def _delete_adf_resource(
-    az_subcommand: list[str],
-    resource_name: str,
-    resource_label: str,
-    tool_name: str,
-    confirm_flag: bool = True,
-) -> dict:
-    """Generic delete for any ADF resource (pipeline, linked-service, dataset).
-
-    Set confirm_flag=False for resource types whose CLI delete command does not
-    accept --yes (e.g. data-flow).
-    """
+async def _create_or_update_pipeline(args: dict) -> dict:
     if err := _check_config():
-        return {**err, "tool": tool_name}
-    if not resource_name:
-        return {"success": False, "error": f"{resource_label}_name is required.", "stderr": "", "tool": tool_name}
-
-    cmd = [
-        *az_subcommand, "delete",
-        *_base_flags(),
-        "--name", resource_name,
-        *( ["--yes"] if confirm_flag else [] ),
-        "--only-show-errors",
-    ]
-    rc, _, stderr = await _run_az(cmd)
-    if rc != 0:
-        return {
-            "success": False,
-            "error": f"Failed to delete {resource_label} '{resource_name}'.",
-            "stderr": stderr,
-            "tool": tool_name,
-        }
-    return {"success": True, "action": "deleted", "name": resource_name, "tool": tool_name}
+        return {**err, "tool": "create_or_update_pipeline"}
+    name = args.get("pipeline_name", "").strip()
+    definition = args.get("pipeline_definition", "").strip()
+    if not name:
+        return {"success": False, "error": "pipeline_name is required.", "stderr": "", "tool": "create_or_update_pipeline"}
+    if not definition:
+        return {"success": False, "error": "pipeline_definition is required.", "stderr": "", "tool": "create_or_update_pipeline"}
+    body, err = _resolve_resource_json(definition, "pipeline_definition")
+    if err:
+        return {**err, "tool": "create_or_update_pipeline"}
+    return await _upsert_adf_resource(_get_client().pipelines.create_or_update, name, body, "pipeline", "create_or_update_pipeline")
 
 
-async def _delete_pipeline(args: dict) -> dict:
-    return await _delete_adf_resource(
-        ["datafactory", "pipeline"], args.get("pipeline_name", "").strip(), "pipeline", "delete_pipeline"
-    )
+async def _create_or_update_linked_service(args: dict) -> dict:
+    if err := _check_config():
+        return {**err, "tool": "create_or_update_linked_service"}
+    name = args.get("linked_service_name", "").strip()
+    definition = args.get("linked_service_definition", "").strip()
+    if not name:
+        return {"success": False, "error": "linked_service_name is required.", "stderr": "", "tool": "create_or_update_linked_service"}
+    if not definition:
+        return {"success": False, "error": "linked_service_definition is required.", "stderr": "", "tool": "create_or_update_linked_service"}
+    body, err = _resolve_resource_json(definition, "linked_service_definition")
+    if err:
+        return {**err, "tool": "create_or_update_linked_service"}
+    return await _upsert_adf_resource(_get_client().linked_services.create_or_update, name, body, "linked service", "create_or_update_linked_service")
 
 
-async def _delete_linked_service(args: dict) -> dict:
-    return await _delete_adf_resource(
-        ["datafactory", "linked-service"], args.get("linked_service_name", "").strip(), "linked_service", "delete_linked_service"
-    )
+async def _create_or_update_dataset(args: dict) -> dict:
+    if err := _check_config():
+        return {**err, "tool": "create_or_update_dataset"}
+    name = args.get("dataset_name", "").strip()
+    definition = args.get("dataset_definition", "").strip()
+    if not name:
+        return {"success": False, "error": "dataset_name is required.", "stderr": "", "tool": "create_or_update_dataset"}
+    if not definition:
+        return {"success": False, "error": "dataset_definition is required.", "stderr": "", "tool": "create_or_update_dataset"}
+    body, err = _resolve_resource_json(definition, "dataset_definition")
+    if err:
+        return {**err, "tool": "create_or_update_dataset"}
+    return await _upsert_adf_resource(_get_client().datasets.create_or_update, name, body, "dataset", "create_or_update_dataset")
 
 
-async def _delete_dataset(args: dict) -> dict:
-    return await _delete_adf_resource(
-        ["datafactory", "dataset"], args.get("dataset_name", "").strip(), "dataset", "delete_dataset"
-    )
-
-
-# ── dataflow helpers ──────────────────────────────────────────────────────────
+# ── Tool 11: list_dataflows ───────────────────────────────────────────────────
 
 async def _list_dataflows(_args: dict) -> dict:
-    return await _list_adf_resources(["datafactory", "data-flow"], "data flows", "list_dataflows")
+    return await _list_adf_resources(_get_client().data_flows.list_by_factory, "data flows", "list_dataflows")
 
+
+# ── Tool 12: create_or_update_dataflow ───────────────────────────────────────
 
 async def _create_or_update_dataflow(args: dict) -> dict:
-    """
-    Upsert a data flow. Unlike pipelines/linked-services/datasets the az CLI
-    provides a native 'update' command for data flows, so we use create→update
-    rather than the delete+recreate pattern. 'create' also requires --flow-type
-    which 'update' does not accept.
-    """
     if err := _check_config():
         return {**err, "tool": "create_or_update_dataflow"}
 
-    name: str = args.get("dataflow_name", "").strip()
-    definition: str = args.get("dataflow_definition", "").strip()
-    flow_type: str = args.get("flow_type", "MappingDataFlow").strip()
+    name = args.get("dataflow_name", "").strip()
+    definition = args.get("dataflow_definition", "").strip()
+    flow_type = args.get("flow_type", "MappingDataFlow").strip()
 
     if not name:
         return {"success": False, "error": "dataflow_name is required.", "stderr": "", "tool": "create_or_update_dataflow"}
@@ -454,241 +293,137 @@ async def _create_or_update_dataflow(args: dict) -> dict:
     if flow_type not in ("MappingDataFlow", "Flowlet"):
         return {"success": False, "error": "flow_type must be 'MappingDataFlow' or 'Flowlet'.", "stderr": "", "tool": "create_or_update_dataflow"}
 
-    az_arg, err = _resolve_resource_json(definition, "dataflow_definition")
+    body, err = _resolve_resource_json(definition, "dataflow_definition")
     if err:
         return {**err, "tool": "create_or_update_dataflow"}
 
-    # Write inline JSON to a temp file to avoid cmd.exe shell-escaping issues.
-    tmp_path: str | None = None
-    if not az_arg.startswith("@"):
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".json", delete=False, encoding="utf-8"
-            ) as tmp:
-                tmp.write(az_arg)
-                tmp_path = tmp.name
-            effective_az_arg = f"@{tmp_path}"
-        except OSError as exc:
-            return {"success": False, "error": f"Failed to write temporary JSON file: {exc}", "stderr": "", "tool": "create_or_update_dataflow"}
+    # Inject flow_type into the properties body if the caller omitted it.
+    props = body.get("properties", body)
+    if "type" not in props:
+        props["type"] = flow_type
+    if "properties" in body:
+        body["properties"] = props
     else:
-        effective_az_arg = az_arg
+        body = props
 
-    try:
-        create_cmd = [
-            "datafactory", "data-flow", "create",
-            *_base_flags(),
-            "--data-flow-name", name,
-            "--flow-type", flow_type,
-            "--properties", effective_az_arg,
-            "--output", "json",
-            "--only-show-errors",
-        ]
-        rc, stdout, stderr = await _run_az(create_cmd)
+    return await _upsert_adf_resource(_get_client().data_flows.create_or_update, name, body, "data flow", "create_or_update_dataflow")
 
-        if rc == 0:
-            try:
-                obj = json.loads(stdout) if stdout else {}
-            except json.JSONDecodeError:
-                obj = {"raw": stdout}
-            return {"success": True, "action": "created", "name": name, "resource": obj, "tool": "create_or_update_dataflow"}
 
-        if "alreadyexists" in stderr.lower() or "already exists" in stderr.lower():
-            update_cmd = [
-                "datafactory", "data-flow", "update",
-                *_base_flags(),
-                "--data-flow-name", name,
-                "--properties", effective_az_arg,
-                "--output", "json",
-                "--only-show-errors",
-            ]
-            rc2, stdout2, stderr2 = await _run_az(update_cmd)
-            if rc2 != 0:
-                return {"success": False, "error": f"Failed to update data flow '{name}'.", "stderr": stderr2, "tool": "create_or_update_dataflow"}
-            try:
-                obj = json.loads(stdout2) if stdout2 else {}
-            except json.JSONDecodeError:
-                obj = {"raw": stdout2}
-            return {"success": True, "action": "updated", "name": name, "resource": obj, "tool": "create_or_update_dataflow"}
+# ── Tool 13–16: delete_* ─────────────────────────────────────────────────────
 
-        return {"success": False, "error": f"Failed to create data flow '{name}'.", "stderr": stderr, "tool": "create_or_update_dataflow"}
-    finally:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+async def _delete_pipeline(args: dict) -> dict:
+    return await _delete_adf_resource(
+        _get_client().pipelines.delete,
+        args.get("pipeline_name", "").strip(),
+        "pipeline_name", "pipeline", "delete_pipeline",
+    )
+
+
+async def _delete_linked_service(args: dict) -> dict:
+    return await _delete_adf_resource(
+        _get_client().linked_services.delete,
+        args.get("linked_service_name", "").strip(),
+        "linked_service_name", "linked service", "delete_linked_service",
+    )
+
+
+async def _delete_dataset(args: dict) -> dict:
+    return await _delete_adf_resource(
+        _get_client().datasets.delete,
+        args.get("dataset_name", "").strip(),
+        "dataset_name", "dataset", "delete_dataset",
+    )
 
 
 async def _delete_dataflow(args: dict) -> dict:
     return await _delete_adf_resource(
-        ["datafactory", "data-flow"], args.get("dataflow_name", "").strip(), "data flow", "delete_dataflow",
-        confirm_flag=False,
+        _get_client().data_flows.delete,
+        args.get("dataflow_name", "").strip(),
+        "dataflow_name", "data flow", "delete_dataflow",
     )
 
 
-# ── Tool 1: create_or_update_pipeline ────────────────────────────────────────
-
-async def _create_or_update_pipeline(args: dict) -> dict:
-    if err := _check_config():
-        return {**err, "tool": "create_or_update_pipeline"}
-
-    name: str = args.get("pipeline_name", "").strip()
-    definition: str = args.get("pipeline_definition", "").strip()
-
-    if not name:
-        return {"success": False, "error": "pipeline_name is required.", "stderr": "", "tool": "create_or_update_pipeline"}
-    if not definition:
-        return {"success": False, "error": "pipeline_definition is required.", "stderr": "", "tool": "create_or_update_pipeline"}
-
-    az_arg, err = _resolve_resource_json(definition, "pipeline_definition")
-    if err:
-        return {**err, "tool": "create_or_update_pipeline"}
-
-    return await _upsert_adf_resource(["datafactory", "pipeline"], name, "--pipeline", az_arg, "create_or_update_pipeline")
-
-
-# ── Tool 2: create_or_update_linked_service ───────────────────────────────────
-
-async def _create_or_update_linked_service(args: dict) -> dict:
-    if err := _check_config():
-        return {**err, "tool": "create_or_update_linked_service"}
-
-    name: str = args.get("linked_service_name", "").strip()
-    definition: str = args.get("linked_service_definition", "").strip()
-
-    if not name:
-        return {"success": False, "error": "linked_service_name is required.", "stderr": "", "tool": "create_or_update_linked_service"}
-    if not definition:
-        return {"success": False, "error": "linked_service_definition is required.", "stderr": "", "tool": "create_or_update_linked_service"}
-
-    az_arg, err = _resolve_resource_json(definition, "linked_service_definition")
-    if err:
-        return {**err, "tool": "create_or_update_linked_service"}
-
-    return await _upsert_adf_resource(["datafactory", "linked-service"], name, "--properties", az_arg, "create_or_update_linked_service")
-
-
-# ── Tool 3: create_or_update_dataset ─────────────────────────────────────────
-
-async def _create_or_update_dataset(args: dict) -> dict:
-    if err := _check_config():
-        return {**err, "tool": "create_or_update_dataset"}
-
-    name: str = args.get("dataset_name", "").strip()
-    definition: str = args.get("dataset_definition", "").strip()
-
-    if not name:
-        return {"success": False, "error": "dataset_name is required.", "stderr": "", "tool": "create_or_update_dataset"}
-    if not definition:
-        return {"success": False, "error": "dataset_definition is required.", "stderr": "", "tool": "create_or_update_dataset"}
-
-    az_arg, err = _resolve_resource_json(definition, "dataset_definition")
-    if err:
-        return {**err, "tool": "create_or_update_dataset"}
-
-    return await _upsert_adf_resource(["datafactory", "dataset"], name, "--properties", az_arg, "create_or_update_dataset")
-
-
-# ── Tool 4: trigger_pipeline_run ─────────────────────────────────────────────
+# ── Tool 17: trigger_pipeline_run ────────────────────────────────────────────
 
 async def _trigger_pipeline_run(args: dict) -> dict:
     if err := _check_config():
         return {**err, "tool": "trigger_pipeline_run"}
 
-    pipeline_name: str = args.get("pipeline_name", "").strip()
+    pipeline_name = args.get("pipeline_name", "").strip()
     parameters: dict | None = args.get("parameters")
 
     if not pipeline_name:
         return {"success": False, "error": "pipeline_name is required.", "stderr": "", "tool": "trigger_pipeline_run"}
 
-    cmd = [
-        "datafactory", "pipeline", "create-run",
-        *_base_flags(),
-        "--name", pipeline_name,
-        "--output", "json",
-        "--only-show-errors",
-    ]
-
-    if parameters:
-        try:
-            cmd += ["--parameters", json.dumps(parameters, separators=(",", ":"))]
-        except (TypeError, ValueError) as exc:
-            return {"success": False, "error": f"Invalid parameters: {exc}", "stderr": "", "tool": "trigger_pipeline_run"}
-
-    rc, stdout, stderr = await _run_az(cmd)
-    if rc != 0:
-        return {
-            "success": False,
-            "error": f"Failed to trigger pipeline run for '{pipeline_name}'.",
-            "stderr": stderr,
-            "tool": "trigger_pipeline_run",
-        }
-
     try:
-        result = json.loads(stdout) if stdout else {}
-    except json.JSONDecodeError:
-        result = {"raw": stdout}
+        response = await _run_sdk(
+            _get_client().pipelines.create_run,
+            ADF_RESOURCE_GROUP,
+            ADF_FACTORY_NAME,
+            pipeline_name,
+            parameters=parameters,
+        )
+        return {"success": True, "run_id": response.run_id, "pipeline_name": pipeline_name}
+    except ResourceNotFoundError:
+        return {"success": False, "error": f"Pipeline '{pipeline_name}' not found.", "stderr": "", "tool": "trigger_pipeline_run"}
+    except HttpResponseError as exc:
+        return {"success": False, "error": f"Failed to trigger pipeline run for '{pipeline_name}': {_sdk_error(exc)}", "stderr": "", "tool": "trigger_pipeline_run"}
 
-    run_id = result.get("runId", "")
-    return {
-        "success": True,
-        "run_id": run_id,
-        "pipeline_name": pipeline_name,
-    }
 
-
-# ── Tool 5: get_pipeline_run_status ──────────────────────────────────────────
+# ── Tool 18: get_pipeline_run_status ─────────────────────────────────────────
 
 async def _get_pipeline_run_status(args: dict) -> dict:
     if err := _check_config():
         return {**err, "tool": "get_pipeline_run_status"}
 
-    run_id: str = args.get("run_id", "").strip()
+    run_id = args.get("run_id", "").strip()
     if not run_id:
         return {"success": False, "error": "run_id is required.", "stderr": "", "tool": "get_pipeline_run_status"}
 
-    cmd = [
-        "datafactory", "pipeline-run", "show",
-        *_base_flags(),
-        "--run-id", run_id,
-        "--output", "json",
-        "--only-show-errors",
-    ]
-
-    rc, stdout, stderr = await _run_az(cmd)
-    if rc != 0:
-        return {
-            "success": False,
-            "error": f"Failed to retrieve pipeline run status for run ID '{run_id}'.",
-            "stderr": stderr,
-            "tool": "get_pipeline_run_status",
-        }
-
     try:
-        data = json.loads(stdout) if stdout else {}
-    except json.JSONDecodeError:
-        data = {"raw": stdout}
+        run = await _run_sdk(
+            _get_client().pipeline_runs.get,
+            ADF_RESOURCE_GROUP,
+            ADF_FACTORY_NAME,
+            run_id,
+        )
+        return {
+            "success": True,
+            "run_id": run_id,
+            "pipeline_name": run.pipeline_name or "",
+            "status": run.status or "",
+            "run_start": run.run_start.isoformat() if run.run_start else None,
+            "run_end": run.run_end.isoformat() if run.run_end else None,
+            "duration_ms": run.duration_in_ms,
+            "message": run.message or "",
+            "run_group_id": run.run_group_id or "",
+        }
+    except ResourceNotFoundError:
+        return {"success": False, "error": f"Pipeline run '{run_id}' not found.", "stderr": "", "tool": "get_pipeline_run_status"}
+    except HttpResponseError as exc:
+        return {"success": False, "error": f"Failed to retrieve pipeline run status for '{run_id}': {_sdk_error(exc)}", "stderr": "", "tool": "get_pipeline_run_status"}
 
-    return {
-        "success": True,
-        "run_id": run_id,
-        "pipeline_name": data.get("pipelineName", ""),
-        "status": data.get("status", ""),
-        "run_start": data.get("runStart", None),
-        "run_end": data.get("runEnd", None),
-        "duration_ms": data.get("durationInMs", None),
-        "message": data.get("message", ""),
-        "run_group_id": data.get("runGroupId", ""),
-    }
 
+# ── Tool 19: get_activity_run_logs ───────────────────────────────────────────
 
-# ── Tool 6: get_activity_run_logs ────────────────────────────────────────────
+def _parse_dt(value: str | None, fallback: datetime) -> datetime:
+    """Parse an ISO 8601 string to a datetime, falling back to a default."""
+    if not value:
+        return fallback
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return fallback
+
 
 async def _get_activity_run_logs(args: dict) -> dict:
     if err := _check_config():
         return {**err, "tool": "get_activity_run_logs"}
 
-    run_id: str = args.get("run_id", "").strip()
+    run_id = args.get("run_id", "").strip()
     if not run_id:
         return {"success": False, "error": "run_id is required.", "stderr": "", "tool": "get_activity_run_logs"}
 
@@ -701,9 +436,9 @@ async def _get_activity_run_logs(args: dict) -> dict:
         if not status_result.get("success"):
             return {**status_result, "tool": "get_activity_run_logs"}
 
+        pipeline_status = status_result.get("status", "")
         run_start = status_result.get("run_start")
         run_end = status_result.get("run_end")
-        pipeline_status = status_result.get("status", "")
 
         if pipeline_status == "Queued" or not run_start:
             return {
@@ -717,51 +452,44 @@ async def _get_activity_run_logs(args: dict) -> dict:
         if not last_updated_after:
             last_updated_after = run_start
         if not last_updated_before:
-            if run_end:
-                last_updated_before = run_end
-            else:
-                last_updated_before = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            last_updated_before = run_end or datetime.now(timezone.utc).isoformat()
 
-    cmd = [
-        "datafactory", "activity-run", "query-by-pipeline-run",
-        *_base_flags(),
-        "--run-id", run_id,
-        "--last-updated-after", last_updated_after,
-        "--last-updated-before", last_updated_before,
-        "--output", "json",
-        "--only-show-errors",
-    ]
-
-    rc, stdout, stderr = await _run_az(cmd)
-    if rc != 0:
-        return {
-            "success": False,
-            "error": f"Failed to retrieve activity logs for run ID '{run_id}'.",
-            "stderr": stderr,
-            "tool": "get_activity_run_logs",
-        }
+    now = datetime.now(timezone.utc)
+    filter_params = RunFilterParameters(
+        last_updated_after=_parse_dt(last_updated_after, now),
+        last_updated_before=_parse_dt(last_updated_before, now),
+    )
 
     try:
-        data = json.loads(stdout) if stdout else {}
-    except json.JSONDecodeError:
-        data = {"raw": stdout}
-
-    raw_activities = data.get("value", []) if isinstance(data, dict) else []
+        response = await _run_sdk(
+            _get_client().activity_runs.query_by_pipeline_run,
+            ADF_RESOURCE_GROUP,
+            ADF_FACTORY_NAME,
+            run_id,
+            filter_params,
+        )
+    except HttpResponseError as exc:
+        return {"success": False, "error": f"Failed to retrieve activity logs for run '{run_id}': {_sdk_error(exc)}", "stderr": "", "tool": "get_activity_run_logs"}
 
     activities = []
-    for act in raw_activities:
-        error_info = act.get("error")
+    for act in (response.value or []):
+        error_info = act.error
+        # Suppress empty error objects.
         if isinstance(error_info, dict) and not any(error_info.values()):
             error_info = None
+        elif hasattr(error_info, "as_dict"):
+            error_dict = error_info.as_dict()
+            error_info = error_dict if any(error_dict.values()) else None
+
         activities.append({
-            "activity_name": act.get("activityName", ""),
-            "activity_type": act.get("activityType", ""),
-            "status": act.get("status", ""),
-            "run_start": act.get("activityRunStart", None),
-            "run_end": act.get("activityRunEnd", None),
-            "duration_ms": act.get("durationInMs", None),
+            "activity_name": act.activity_name or "",
+            "activity_type": act.activity_type or "",
+            "status": act.status or "",
+            "run_start": act.activity_run_start.isoformat() if act.activity_run_start else None,
+            "run_end": act.activity_run_end.isoformat() if act.activity_run_end else None,
+            "duration_ms": act.duration_in_ms,
             "error": error_info,
-            "output": act.get("output", None),
+            "output": act.output,
         })
 
     return {
@@ -832,8 +560,7 @@ async def handle_list_tools() -> list[types.Tool]:
             name="create_or_update_pipeline",
             description=(
                 "Create or update an Azure Data Factory pipeline. "
-                "Pass the pipeline definition as an inline JSON string or an absolute file path. "
-                "If the pipeline already exists it will be replaced (delete + create)."
+                "Pass the pipeline definition as an inline JSON string or an absolute file path."
             ),
             inputSchema={
                 "type": "object",
@@ -857,8 +584,7 @@ async def handle_list_tools() -> list[types.Tool]:
             name="create_or_update_linked_service",
             description=(
                 "Create or update an Azure Data Factory linked service. "
-                "Pass the linked service definition as an inline JSON string or an absolute file path. "
-                "If the linked service already exists it will be replaced (delete + create)."
+                "Pass the linked service definition as an inline JSON string or an absolute file path."
             ),
             inputSchema={
                 "type": "object",
@@ -882,8 +608,7 @@ async def handle_list_tools() -> list[types.Tool]:
             name="create_or_update_dataset",
             description=(
                 "Create or update an Azure Data Factory dataset. "
-                "Pass the dataset definition as an inline JSON string or an absolute file path. "
-                "If the dataset already exists it will be replaced (delete + create)."
+                "Pass the dataset definition as an inline JSON string or an absolute file path."
             ),
             inputSchema={
                 "type": "object",
@@ -945,8 +670,7 @@ async def handle_list_tools() -> list[types.Tool]:
             name="create_or_update_dataflow",
             description=(
                 "Create or update an Azure Data Factory data flow. "
-                "Pass the data flow properties as an inline JSON string or an absolute file path. "
-                "If the data flow already exists it will be updated in place."
+                "Pass the data flow properties as an inline JSON string or an absolute file path."
             ),
             inputSchema={
                 "type": "object",
@@ -965,7 +689,7 @@ async def handle_list_tools() -> list[types.Tool]:
                     "flow_type": {
                         "type": "string",
                         "enum": ["MappingDataFlow", "Flowlet"],
-                        "description": "Type of data flow. Only required when creating a new data flow; ignored on update. Defaults to 'MappingDataFlow'.",
+                        "description": "Type of data flow. Used as a default if not already present in the definition JSON. Defaults to 'MappingDataFlow'.",
                     },
                 },
                 "required": ["dataflow_name", "dataflow_definition"],
@@ -1093,19 +817,7 @@ async def handle_call_tool(
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 
-async def _check_datafactory_extension() -> None:
-    """Warn to stderr if the az datafactory extension is not installed."""
-    rc, _, _ = await _run_az(["datafactory", "--help"])
-    if rc != 0:
-        print(
-            "WARNING: The 'datafactory' Azure CLI extension does not appear to be installed. "
-            "Run: az extension add --name datafactory",
-            file=sys.stderr,
-        )
-
-
 async def main() -> None:
-    await _check_datafactory_extension()
     logger.info("Starting ADF MCP server (stdio transport).")
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
