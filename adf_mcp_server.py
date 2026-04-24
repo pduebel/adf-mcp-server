@@ -68,7 +68,6 @@ def _check_config() -> dict | None:
         return {
             "success": False,
             "error": f"Missing required environment variables: {', '.join(missing)}",
-            "stderr": "",
         }
     return None
 
@@ -92,7 +91,7 @@ def _get_client() -> DataFactoryManagementClient:
 
 async def _run_sdk(fn, *args, **kwargs):
     """Run a synchronous SDK call in a thread pool so the event loop is never blocked."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
 
 
@@ -113,16 +112,16 @@ def _resolve_resource_json(definition: str, field_name: str) -> tuple[dict | Non
         try:
             return json.loads(value), None
         except json.JSONDecodeError as exc:
-            return None, {"success": False, "error": f"{field_name} is not valid JSON: {exc}", "stderr": ""}
+            return None, {"success": False, "error": f"{field_name} is not valid JSON: {exc}"}
 
     abs_path = os.path.abspath(value)
     if not os.path.isfile(abs_path):
-        return None, {"success": False, "error": f"{field_name} file not found: {abs_path}", "stderr": ""}
+        return None, {"success": False, "error": f"{field_name} file not found: {abs_path}"}
     try:
         with open(abs_path, encoding="utf-8") as fh:
             return json.load(fh), None
     except json.JSONDecodeError as exc:
-        return None, {"success": False, "error": f"{field_name} file is not valid JSON: {exc}", "stderr": ""}
+        return None, {"success": False, "error": f"{field_name} file is not valid JSON: {exc}"}
 
 
 def _sdk_error(exc: HttpResponseError) -> str:
@@ -137,11 +136,12 @@ async def _list_adf_resources(list_fn, resource_label: str, tool_name: str) -> d
     if err := _check_config():
         return {**err, "tool": tool_name}
     try:
-        items = await _run_sdk(list_fn, ADF_RESOURCE_GROUP, ADF_FACTORY_NAME)
-        names = [item.name for item in items if item.name]
+        names = await _run_sdk(
+            lambda: [item.name for item in list_fn(ADF_RESOURCE_GROUP, ADF_FACTORY_NAME) if item.name]
+        )
         return {"success": True, "count": len(names), "names": names, "tool": tool_name}
     except HttpResponseError as exc:
-        return {"success": False, "error": f"Failed to list {resource_label}: {_sdk_error(exc)}", "stderr": "", "tool": tool_name}
+        return {"success": False, "error": f"Failed to list {resource_label}: {_sdk_error(exc)}", "tool": tool_name}
 
 
 async def _get_adf_resource(get_fn, name: str, name_field: str, resource_label: str, tool_name: str) -> dict:
@@ -149,14 +149,14 @@ async def _get_adf_resource(get_fn, name: str, name_field: str, resource_label: 
     if err := _check_config():
         return {**err, "tool": tool_name}
     if not name:
-        return {"success": False, "error": f"{name_field} is required.", "stderr": "", "tool": tool_name}
+        return {"success": False, "error": f"{name_field} is required.", "tool": tool_name}
     try:
         resource = await _run_sdk(get_fn, ADF_RESOURCE_GROUP, ADF_FACTORY_NAME, name)
         return {"success": True, "name": name, "resource": resource.as_dict(), "tool": tool_name}
     except ResourceNotFoundError:
-        return {"success": False, "error": f"{resource_label} '{name}' not found.", "stderr": "", "tool": tool_name}
+        return {"success": False, "error": f"{resource_label} '{name}' not found.", "tool": tool_name}
     except HttpResponseError as exc:
-        return {"success": False, "error": f"Failed to get {resource_label} '{name}': {_sdk_error(exc)}", "stderr": "", "tool": tool_name}
+        return {"success": False, "error": f"Failed to get {resource_label} '{name}': {_sdk_error(exc)}", "tool": tool_name}
 
 
 async def _upsert_adf_resource(upsert_fn, name: str, body: dict, resource_label: str, tool_name: str) -> dict:
@@ -165,7 +165,7 @@ async def _upsert_adf_resource(upsert_fn, name: str, body: dict, resource_label:
         result = await _run_sdk(upsert_fn, ADF_RESOURCE_GROUP, ADF_FACTORY_NAME, name, body)
         return {"success": True, "action": "upserted", "name": name, "resource": result.as_dict(), "tool": tool_name}
     except HttpResponseError as exc:
-        return {"success": False, "error": f"Failed to create or update {resource_label} '{name}': {_sdk_error(exc)}", "stderr": "", "tool": tool_name}
+        return {"success": False, "error": f"Failed to create or update {resource_label} '{name}': {_sdk_error(exc)}", "tool": tool_name}
 
 
 async def _delete_adf_resource(delete_fn, name: str, name_field: str, resource_label: str, tool_name: str) -> dict:
@@ -173,14 +173,14 @@ async def _delete_adf_resource(delete_fn, name: str, name_field: str, resource_l
     if err := _check_config():
         return {**err, "tool": tool_name}
     if not name:
-        return {"success": False, "error": f"{name_field} is required.", "stderr": "", "tool": tool_name}
+        return {"success": False, "error": f"{name_field} is required.", "tool": tool_name}
     try:
         await _run_sdk(delete_fn, ADF_RESOURCE_GROUP, ADF_FACTORY_NAME, name)
         return {"success": True, "action": "deleted", "name": name, "tool": tool_name}
     except ResourceNotFoundError:
-        return {"success": False, "error": f"{resource_label} '{name}' not found.", "stderr": "", "tool": tool_name}
+        return {"success": False, "error": f"{resource_label} '{name}' not found.", "tool": tool_name}
     except HttpResponseError as exc:
-        return {"success": False, "error": f"Failed to delete {resource_label} '{name}': {_sdk_error(exc)}", "stderr": "", "tool": tool_name}
+        return {"success": False, "error": f"Failed to delete {resource_label} '{name}': {_sdk_error(exc)}", "tool": tool_name}
 
 
 # ── Tool 1–3: list_* ──────────────────────────────────────────────────────────
@@ -231,9 +231,9 @@ async def _create_or_update_pipeline(args: dict) -> dict:
     name = args.get("pipeline_name", "").strip()
     definition = args.get("pipeline_definition", "").strip()
     if not name:
-        return {"success": False, "error": "pipeline_name is required.", "stderr": "", "tool": "create_or_update_pipeline"}
+        return {"success": False, "error": "pipeline_name is required.", "tool": "create_or_update_pipeline"}
     if not definition:
-        return {"success": False, "error": "pipeline_definition is required.", "stderr": "", "tool": "create_or_update_pipeline"}
+        return {"success": False, "error": "pipeline_definition is required.", "tool": "create_or_update_pipeline"}
     body, err = _resolve_resource_json(definition, "pipeline_definition")
     if err:
         return {**err, "tool": "create_or_update_pipeline"}
@@ -246,9 +246,9 @@ async def _create_or_update_linked_service(args: dict) -> dict:
     name = args.get("linked_service_name", "").strip()
     definition = args.get("linked_service_definition", "").strip()
     if not name:
-        return {"success": False, "error": "linked_service_name is required.", "stderr": "", "tool": "create_or_update_linked_service"}
+        return {"success": False, "error": "linked_service_name is required.", "tool": "create_or_update_linked_service"}
     if not definition:
-        return {"success": False, "error": "linked_service_definition is required.", "stderr": "", "tool": "create_or_update_linked_service"}
+        return {"success": False, "error": "linked_service_definition is required.", "tool": "create_or_update_linked_service"}
     body, err = _resolve_resource_json(definition, "linked_service_definition")
     if err:
         return {**err, "tool": "create_or_update_linked_service"}
@@ -261,9 +261,9 @@ async def _create_or_update_dataset(args: dict) -> dict:
     name = args.get("dataset_name", "").strip()
     definition = args.get("dataset_definition", "").strip()
     if not name:
-        return {"success": False, "error": "dataset_name is required.", "stderr": "", "tool": "create_or_update_dataset"}
+        return {"success": False, "error": "dataset_name is required.", "tool": "create_or_update_dataset"}
     if not definition:
-        return {"success": False, "error": "dataset_definition is required.", "stderr": "", "tool": "create_or_update_dataset"}
+        return {"success": False, "error": "dataset_definition is required.", "tool": "create_or_update_dataset"}
     body, err = _resolve_resource_json(definition, "dataset_definition")
     if err:
         return {**err, "tool": "create_or_update_dataset"}
@@ -287,11 +287,11 @@ async def _create_or_update_dataflow(args: dict) -> dict:
     flow_type = args.get("flow_type", "MappingDataFlow").strip()
 
     if not name:
-        return {"success": False, "error": "dataflow_name is required.", "stderr": "", "tool": "create_or_update_dataflow"}
+        return {"success": False, "error": "dataflow_name is required.", "tool": "create_or_update_dataflow"}
     if not definition:
-        return {"success": False, "error": "dataflow_definition is required.", "stderr": "", "tool": "create_or_update_dataflow"}
+        return {"success": False, "error": "dataflow_definition is required.", "tool": "create_or_update_dataflow"}
     if flow_type not in ("MappingDataFlow", "Flowlet"):
-        return {"success": False, "error": "flow_type must be 'MappingDataFlow' or 'Flowlet'.", "stderr": "", "tool": "create_or_update_dataflow"}
+        return {"success": False, "error": "flow_type must be 'MappingDataFlow' or 'Flowlet'.", "tool": "create_or_update_dataflow"}
 
     body, err = _resolve_resource_json(definition, "dataflow_definition")
     if err:
@@ -301,10 +301,6 @@ async def _create_or_update_dataflow(args: dict) -> dict:
     props = body.get("properties", body)
     if "type" not in props:
         props["type"] = flow_type
-    if "properties" in body:
-        body["properties"] = props
-    else:
-        body = props
 
     return await _upsert_adf_resource(_get_client().data_flows.create_or_update, name, body, "data flow", "create_or_update_dataflow")
 
@@ -353,7 +349,7 @@ async def _trigger_pipeline_run(args: dict) -> dict:
     parameters: dict | None = args.get("parameters")
 
     if not pipeline_name:
-        return {"success": False, "error": "pipeline_name is required.", "stderr": "", "tool": "trigger_pipeline_run"}
+        return {"success": False, "error": "pipeline_name is required.", "tool": "trigger_pipeline_run"}
 
     try:
         response = await _run_sdk(
@@ -363,11 +359,11 @@ async def _trigger_pipeline_run(args: dict) -> dict:
             pipeline_name,
             parameters=parameters,
         )
-        return {"success": True, "run_id": response.run_id, "pipeline_name": pipeline_name}
+        return {"success": True, "run_id": response.run_id, "pipeline_name": pipeline_name, "tool": "trigger_pipeline_run"}
     except ResourceNotFoundError:
-        return {"success": False, "error": f"Pipeline '{pipeline_name}' not found.", "stderr": "", "tool": "trigger_pipeline_run"}
+        return {"success": False, "error": f"Pipeline '{pipeline_name}' not found.", "tool": "trigger_pipeline_run"}
     except HttpResponseError as exc:
-        return {"success": False, "error": f"Failed to trigger pipeline run for '{pipeline_name}': {_sdk_error(exc)}", "stderr": "", "tool": "trigger_pipeline_run"}
+        return {"success": False, "error": f"Failed to trigger pipeline run for '{pipeline_name}': {_sdk_error(exc)}", "tool": "trigger_pipeline_run"}
 
 
 # ── Tool 18: get_pipeline_run_status ─────────────────────────────────────────
@@ -378,7 +374,7 @@ async def _get_pipeline_run_status(args: dict) -> dict:
 
     run_id = args.get("run_id", "").strip()
     if not run_id:
-        return {"success": False, "error": "run_id is required.", "stderr": "", "tool": "get_pipeline_run_status"}
+        return {"success": False, "error": "run_id is required.", "tool": "get_pipeline_run_status"}
 
     try:
         run = await _run_sdk(
@@ -397,11 +393,12 @@ async def _get_pipeline_run_status(args: dict) -> dict:
             "duration_ms": run.duration_in_ms,
             "message": run.message or "",
             "run_group_id": run.run_group_id or "",
+            "tool": "get_pipeline_run_status",
         }
     except ResourceNotFoundError:
-        return {"success": False, "error": f"Pipeline run '{run_id}' not found.", "stderr": "", "tool": "get_pipeline_run_status"}
+        return {"success": False, "error": f"Pipeline run '{run_id}' not found.", "tool": "get_pipeline_run_status"}
     except HttpResponseError as exc:
-        return {"success": False, "error": f"Failed to retrieve pipeline run status for '{run_id}': {_sdk_error(exc)}", "stderr": "", "tool": "get_pipeline_run_status"}
+        return {"success": False, "error": f"Failed to retrieve pipeline run status for '{run_id}': {_sdk_error(exc)}", "tool": "get_pipeline_run_status"}
 
 
 # ── Tool 19: get_activity_run_logs ───────────────────────────────────────────
@@ -425,7 +422,7 @@ async def _get_activity_run_logs(args: dict) -> dict:
 
     run_id = args.get("run_id", "").strip()
     if not run_id:
-        return {"success": False, "error": "run_id is required.", "stderr": "", "tool": "get_activity_run_logs"}
+        return {"success": False, "error": "run_id is required.", "tool": "get_activity_run_logs"}
 
     last_updated_after: str | None = args.get("last_updated_after")
     last_updated_before: str | None = args.get("last_updated_before")
@@ -447,6 +444,7 @@ async def _get_activity_run_logs(args: dict) -> dict:
                 "activity_count": 0,
                 "activities": [],
                 "note": f"Pipeline run is '{pipeline_status}' and has not started yet. No activity logs available.",
+                "tool": "get_activity_run_logs",
             }
 
         if not last_updated_after:
@@ -469,7 +467,7 @@ async def _get_activity_run_logs(args: dict) -> dict:
             filter_params,
         )
     except HttpResponseError as exc:
-        return {"success": False, "error": f"Failed to retrieve activity logs for run '{run_id}': {_sdk_error(exc)}", "stderr": "", "tool": "get_activity_run_logs"}
+        return {"success": False, "error": f"Failed to retrieve activity logs for run '{run_id}': {_sdk_error(exc)}", "tool": "get_activity_run_logs"}
 
     activities = []
     for act in (response.value or []):
@@ -497,6 +495,7 @@ async def _get_activity_run_logs(args: dict) -> dict:
         "run_id": run_id,
         "activity_count": len(activities),
         "activities": activities,
+        "tool": "get_activity_run_logs",
     }
 
 
@@ -806,7 +805,6 @@ async def handle_call_tool(
         result = {
             "success": False,
             "error": f"Unknown tool: '{name}'. Available tools: {list(dispatch)}",
-            "stderr": "",
             "tool": name,
         }
     else:
