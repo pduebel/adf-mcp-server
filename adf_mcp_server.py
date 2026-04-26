@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timezone
 
 import mcp.types as types
@@ -127,6 +128,18 @@ def _resolve_resource_json(definition: str, field_name: str) -> tuple[dict | Non
 def _sdk_error(exc: HttpResponseError) -> str:
     """Extract a readable message from an HttpResponseError."""
     return str(exc.message) if exc.message else str(exc)
+
+
+def _fmt_utc(dt: datetime | None) -> str | None:
+    """Format a datetime as an ISO 8601 string with an explicit UTC offset (+00:00)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+_TERMINAL_STATUSES = {"Succeeded", "Failed", "Cancelled", "TimedOut"}
 
 
 # ── list / get helpers ────────────────────────────────────────────────────────
@@ -368,14 +381,8 @@ async def _trigger_pipeline_run(args: dict) -> dict:
 
 # ── Tool 18: get_pipeline_run_status ─────────────────────────────────────────
 
-async def _get_pipeline_run_status(args: dict) -> dict:
-    if err := _check_config():
-        return {**err, "tool": "get_pipeline_run_status"}
-
-    run_id = args.get("run_id", "").strip()
-    if not run_id:
-        return {"success": False, "error": "run_id is required.", "tool": "get_pipeline_run_status"}
-
+async def _fetch_run_status(run_id: str) -> dict:
+    """Single SDK call returning the current pipeline run status."""
     try:
         run = await _run_sdk(
             _get_client().pipeline_runs.get,
@@ -388,8 +395,8 @@ async def _get_pipeline_run_status(args: dict) -> dict:
             "run_id": run_id,
             "pipeline_name": run.pipeline_name or "",
             "status": run.status or "",
-            "run_start": run.run_start.isoformat() if run.run_start else None,
-            "run_end": run.run_end.isoformat() if run.run_end else None,
+            "run_start": _fmt_utc(run.run_start),
+            "run_end": _fmt_utc(run.run_end),
             "duration_ms": run.duration_in_ms,
             "message": run.message or "",
             "run_group_id": run.run_group_id or "",
@@ -399,6 +406,38 @@ async def _get_pipeline_run_status(args: dict) -> dict:
         return {"success": False, "error": f"Pipeline run '{run_id}' not found.", "tool": "get_pipeline_run_status"}
     except HttpResponseError as exc:
         return {"success": False, "error": f"Failed to retrieve pipeline run status for '{run_id}': {_sdk_error(exc)}", "tool": "get_pipeline_run_status"}
+
+
+async def _get_pipeline_run_status(args: dict) -> dict:
+    if err := _check_config():
+        return {**err, "tool": "get_pipeline_run_status"}
+
+    run_id = args.get("run_id", "").strip()
+    if not run_id:
+        return {"success": False, "error": "run_id is required.", "tool": "get_pipeline_run_status"}
+
+    wait = bool(args.get("wait_for_completion", False))
+    poll_interval = max(5, min(int(args.get("poll_interval_seconds", 15)), 60))
+    timeout = max(30, min(int(args.get("timeout_seconds", 300)), 3600))
+
+    result = await _fetch_run_status(run_id)
+    if not wait or not result.get("success"):
+        return result
+
+    deadline = time.monotonic() + timeout
+    while result["status"] not in _TERMINAL_STATUSES:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            result["timed_out"] = True
+            result["note"] = f"Polling stopped after {timeout}s; run is still '{result['status']}'."
+            break
+        await asyncio.sleep(min(poll_interval, remaining))
+        new_result = await _fetch_run_status(run_id)
+        if not new_result.get("success"):
+            return new_result
+        result = new_result
+
+    return result
 
 
 # ── Tool 19: get_activity_run_logs ───────────────────────────────────────────
@@ -483,8 +522,8 @@ async def _get_activity_run_logs(args: dict) -> dict:
             "activity_name": act.activity_name or "",
             "activity_type": act.activity_type or "",
             "status": act.status or "",
-            "run_start": act.activity_run_start.isoformat() if act.activity_run_start else None,
-            "run_end": act.activity_run_end.isoformat() if act.activity_run_end else None,
+            "run_start": _fmt_utc(act.activity_run_start),
+            "run_end": _fmt_utc(act.activity_run_end),
             "duration_ms": act.duration_in_ms,
             "error": error_info,
             "output": act.output,
@@ -732,7 +771,9 @@ async def handle_list_tools() -> list[types.Tool]:
             description=(
                 "Check the status of an ADF pipeline run by run ID. "
                 "Returns status (Queued/InProgress/Succeeded/Failed/Cancelled), "
-                "start/end timestamps, duration, and any error message."
+                "start/end timestamps (UTC, ISO 8601 with +00:00 offset), duration, and any error message. "
+                "Set wait_for_completion=true to poll internally until the run finishes — "
+                "this avoids the need to call this tool repeatedly."
             ),
             inputSchema={
                 "type": "object",
@@ -740,6 +781,22 @@ async def handle_list_tools() -> list[types.Tool]:
                     "run_id": {
                         "type": "string",
                         "description": "The pipeline run ID returned by trigger_pipeline_run.",
+                    },
+                    "wait_for_completion": {
+                        "type": "boolean",
+                        "description": (
+                            "If true, poll until the run reaches a terminal state "
+                            "(Succeeded/Failed/Cancelled/TimedOut) before returning. "
+                            "Defaults to false."
+                        ),
+                    },
+                    "poll_interval_seconds": {
+                        "type": "integer",
+                        "description": "Seconds between status checks when wait_for_completion is true. Clamped to [5, 60]. Defaults to 15.",
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "Maximum seconds to wait when wait_for_completion is true. Clamped to [30, 3600]. Defaults to 300.",
                     },
                 },
                 "required": ["run_id"],

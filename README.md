@@ -36,7 +36,7 @@ MCP is emerging as the standard protocol for connecting AI assistants to externa
 
 As an example, I used the following prompt in Claude Desktop using Opus 4.7.
 
-"Build a medallion architecture (bronze/silver/gold) data pipeline in Azure Data Factory that ingests weather and air quality data from the Open-Meteo API for Regents Park, London (lat 51.531, lon -0.160).
+`Build a medallion architecture (bronze/silver/gold) data pipeline in Azure Data Factory that ingests weather and air quality data from the Open-Meteo API for Regents Park, London (lat 51.531, lon -0.160).
 
 You have ADF MCP tools available. The storage account is teststg1 (ADLS Gen2, system-assigned managed identity) with containers raw, silver, and gold.
 
@@ -46,9 +46,9 @@ Silver: Use Mapping Data Flows to flatten the raw JSON into clean Delta tables.
 
 Gold: Two outputs as Delta — a daily conditions view (forecast joined with daily-aggregated air quality) and a forecast accuracy view (forecast joined with actuals, with error metrics derived).
 
-Follow data factory and lakehouse best practices and test to ensure that any pipelines are working correctly."
+Follow data factory and lakehouse best practices and test to ensure that any pipelines are working correctly.`
 
-### REMEMBER TO FIX THE ISSUE WHERE CLAUDE DESKTOP IS GETTING CONFUSED BY THE TIMEZONE WHEN CHECKING PIPELINE RUNS
+I provided no other input, except to ask the model to continue. It created all the linked services, datasets, data flows, and pipelines, as well as autonomously running and debugging them. The result was a fully functioning pipeline that followed a medallion lakehouse architecture.
 
 
 ## Architecture
