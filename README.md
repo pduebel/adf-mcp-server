@@ -5,7 +5,7 @@ An MCP server that enables AI assistants to build, manage, and monitor Azure Dat
 
 ## Why This Exists
 
-AI assistants have the potential to hugely speed up the development, testing, and maintenance of pipelines in Azure Data Factory - but only if they have direct access to the platform. Developing in ADF with AI assistance can require multiple iterations to reach a solution, and without direct access this involves copying pipeline definitions and error messages back and forth, manually deploying iterarions, and losing a lot of time.
+AI assistants have the potential to hugely speed up the development, testing, and maintenance of pipelines in Azure Data Factory - but only if they have direct access to the platform. Developing in ADF with AI assistance can require multiple iterations to reach a solution, and without direct access this involves copying pipeline definitions and error messages back and forth, manually deploying iterations, and losing a lot of time.
 
 This project aims to remedy this by providing an MCP-compatible AI assistant structured, autonomous access to ADF - full visibility into pipelines, the ability to create and modify resources, and direct feedback from pipeline runs. The assistant can iterate on a pipeline definition, trigger a run, inspect the failure, and fix the problem without any manual intervention.
 
@@ -45,7 +45,7 @@ The following prompt was given to Claude Desktop (Opus 4.7) with the ADF MCP ser
 >
 >Gold: Two outputs as Delta — a daily conditions view (forecast joined with daily-aggregated air quality) and a forecast accuracy view (forecast joined with actuals, with error metrics derived).
 >
->Follow data factory and lakehouse best practices and test to ensure that any pipelines are working correctly.`
+>Follow data factory and lakehouse best practices and test to ensure that any pipelines are working correctly.
 >
 From that single prompt, with no further input beyond asking the model to continue, it autonomously created all linked services, datasets, data flows, and pipelines by iterating on failures until the full medallion pipeline ran successfully.
 
@@ -143,10 +143,3 @@ You should see two JSON-RPC responses: an `initialize` result and then the `list
 - **`azure-mgmt-datafactory`** — Azure Data Factory management SDK
 - **`azure-identity`** — `DefaultAzureCredential` for ambient authentication
 - **Azure Data Factory** — target platform for all resource management and pipeline execution
-
-
-## About
-
-Built to demonstrate how MCP can bridge AI assistants and enterprise data platforms. Part of a broader interest in the intersection of data engineering and AI tooling.
-
-[LinkedIn](https://www.linkedin.com/in/peter-duebel/)
