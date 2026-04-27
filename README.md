@@ -1,31 +1,30 @@
 # Azure Data Factory MCP Server
 
-An MCP server that enables AI assistants like Claude to build, manage, and monitor Azure Data Factory pipelines through natural conversation.
+An MCP server that enables AI assistants to build, manage, and monitor Azure Data Factory pipelines through natural conversation.
 
 
 ## Why This Exists
 
-AI assistants have the potential to hugely speed up the development, testing and maintenance of pipelines in Azure Data Factory. However, this potential can be difficult to materialise using current tooling. Most chat-based AI tools have no way of connecting to ADF directly, and current models don't seem to be able to produce ADF artifacts with the same level of accuracy as they can do with artifacts coded in common languages. As a result, managing pipelines in ADF with AI assistance can involve multiple iterations to reach a solution, which can involve copying and pasting vast amounts of error messages and pipeline definitions from ADF into the AI tool and deploying and running different versions of artifacts.
+AI assistants have the potential to hugely speed up the development, testing, and maintenance of pipelines in Azure Data Factory - but only if they have direct access to the platform. Developing in ADF with AI assistance can require multiple iterations to reach a solution, and without direct access this involves copying pipeline definitions and error messages back and forth, manually deploying iterarions, and losing a lot of time.
 
-By enabling AI assistants to connect to ADF in a structured and autonomous fashion, they can have full context of the pipelines they are working with and can iterate quickly, leading to a huge reduction in the time to reach a final solution, as well as having potential applications with autonomous agents used for things like pipeline monitoring and failure handling.
+This project aims to remedy this by providing an MCP-compatible AI assistant structured, autonomous access to ADF - full visibility into pipelines, the ability to create and modify resources, and direct feedback from pipeline runs. The assistant can iterate on a pipeline definition, trigger a run, inspect the failure, and fix the problem without any manual intervention.
 
-MCP is emerging as the standard protocol for connecting AI assistants to external tools and processes. Enterprise data platform tooling is a relatively unexplored area for MCP adoption. This project provides a working local MCP server that gives Claude Desktop direct access to ADF operations, including creating pipelines, managing resources, and monitoring runs.
-
+MCP is emerging as the standard protocol for connecting AI assistants to external tools and services. Enterprise data platform tooling is a relatively unexplored area for MCP adoption, with this project being an early step in that direction.
 
 ## What It Can Do
 
 **Inspect the factory**
 - List all pipelines, linked services, datasets, and data flows by name
-- Fetch the full JSON definition of any individual resource
+- Fetch the full JSON definition of any individual pipeline, linked service, or dataset
 
 **Build and modify resources**
-- Create or update pipelines, linked services, datasets, and data flows — accepting either an inline JSON string or a path to a local `.json` file
-- Upsert semantics: if a resource already exists it is replaced atomically, so Claude can iterate on a definition without manual cleanup
+- Create or update pipelines, linked services, datasets, and data flows — accepting either an inline JSON string or an absolute path to a local `.json` file
+- True upsert semantics via the Azure SDK: if a resource already exists it is updated in place, so Claude can iterate on a definition without any cleanup step
 - Parameterised pipelines are fully supported — parameters can be supplied at trigger time
 
 **Run and monitor**
 - Trigger a pipeline run (with optional runtime parameters) and get back the run ID
-- Poll run status: Queued → InProgress → Succeeded / Failed / Cancelled, with start/end timestamps and duration
+- Poll run status: Queued → InProgress → Succeeded / Failed / Cancelled, with start/end timestamps and duration; optionally block until the run reaches a terminal state
 - Fetch per-activity logs for a run, including activity type, timing, output, and structured error details — giving Claude full visibility into exactly where and why a pipeline failed
 
 **Delete**
@@ -34,51 +33,39 @@ MCP is emerging as the standard protocol for connecting AI assistants to externa
 
 ### Example Workflow
 
-As an example, I used the following prompt in Claude Desktop using Opus 4.7.
+The following prompt was given to Claude Desktop (Opus 4.7) with the ADF MCP server connected:
 
-`Build a medallion architecture (bronze/silver/gold) data pipeline in Azure Data Factory that ingests weather and air quality data from the Open-Meteo API for Regents Park, London (lat 51.531, lon -0.160).
-
-You have ADF MCP tools available. The storage account is teststg1 (ADLS Gen2, system-assigned managed identity) with containers raw, silver, and gold.
-
-Bronze: Ingest three Open-Meteo endpoints as raw JSON into date-partitioned folders in the raw container: weather forecast, yesterday's weather actuals, and air quality.
-
-Silver: Use Mapping Data Flows to flatten the raw JSON into clean Delta tables. 
-
-Gold: Two outputs as Delta — a daily conditions view (forecast joined with daily-aggregated air quality) and a forecast accuracy view (forecast joined with actuals, with error metrics derived).
-
-Follow data factory and lakehouse best practices and test to ensure that any pipelines are working correctly.`
-
-I provided no other input, except to ask the model to continue. It created all the linked services, datasets, data flows, and pipelines, as well as autonomously running and debugging them. The result was a fully functioning pipeline that followed a medallion lakehouse architecture.
+>Build a medallion architecture (bronze/silver/gold) data pipeline in Azure Data Factory that ingests weather and air quality data from the Open-Meteo API for Regents Park, London (lat 51.531, lon -0.160).
+>
+>You have ADF MCP tools available. The storage account is teststg1 (ADLS Gen2, system-assigned managed identity) with containers raw, silver, and gold.
+>
+>Bronze: Ingest three Open-Meteo endpoints as raw JSON into date-partitioned folders in the raw container: weather forecast, yesterday's weather actuals, and air quality.
+>
+>Silver: Use Mapping Data Flows to flatten the raw JSON into clean Delta tables. 
+>
+>Gold: Two outputs as Delta — a daily conditions view (forecast joined with daily-aggregated air quality) and a forecast accuracy view (forecast joined with actuals, with error metrics derived).
+>
+>Follow data factory and lakehouse best practices and test to ensure that any pipelines are working correctly.`
+>
+From that single prompt, with no further input beyond asking the model to continue, it autonomously created all linked services, datasets, data flows, and pipelines by iterating on failures until the full medallion pipeline ran successfully.
 
 
 ## Architecture
 
-The server is a single Python file (`adf_mcp_server.py`) that sits between Claude Desktop and Azure Data Factory.
+The server is a single Python file (`adf_mcp_server.py`) that sits between an MCP-compatible AI tool and Azure Data Factory. 
 
-**Transport — MCP over stdio**
-Claude Desktop launches the server as a child process and communicates over stdin/stdout using the [Model Context Protocol](https://modelcontextprotocol.io/) JSON-RPC wire format. All diagnostic logging goes to stderr so it never interferes with the protocol stream.
-
-**Azure API layer — Azure CLI**
-Rather than calling the ADF REST API directly, the server shells out to the `az datafactory` CLI extension. This keeps authentication entirely ambient: if you are logged in with `az login`, the server inherits those credentials automatically — no secrets in code or config.
-
-Each CLI call runs via `asyncio.create_subprocess_exec` so the MCP event loop is never blocked. Every call has a 90-second timeout; if it fires, the server returns a structured error rather than hanging the tool call. On Windows, `az` is a `.cmd` batch file that cannot be executed directly — the server resolves the full path to `az.cmd` (or falls back to `cmd /c az`) to handle this transparently.
-
-**Upsert pattern**
-The `az datafactory` CLI has no native upsert command for most resource types. When a create call fails because the resource already exists, the server deletes the old version and immediately recreates it with the new definition. For data flows, the CLI does provide a native `update` command, so the server uses create→update instead.
-
-**Resource definitions**
-Create/update tools accept a resource body as either a compact inline JSON string or an `@filepath` reference to a local `.json` file. Inline JSON is always written to a temporary file before being passed to `az` — this avoids Windows `cmd.exe` misinterpreting special characters that appear inside ADF expressions.
+The AI tool launches it as a child process and communicates over stdin/stdout using [MCP](https://modelcontextprotocol.io/) JSON-RPC. All ADF operations go through the `azure-mgmt-datafactory` Python SDK. Authentication is handled by `DefaultAzureCredential`, which tries `az login` tokens, environment-variable service principals, and managed identity in order, so no credentials in code. Because the SDK is synchronous, every call runs via `asyncio.run_in_executor` so the MCP event loop is never blocked. All create/update tools use the SDK's native `create_or_update()` method. Resource definitions are accepted as either an inline JSON string or an absolute path to a local `.json` file.
 
 
 ## Getting Started
+> **Note:** This project was developed and tested using Claude Desktop. The setup instructions below are specific to Claude Desktop. Other MCP-compatible tools should work but may require different configuration - refer to your tool's documentation for how to connect to an MCP server over stdio.
 
 ### Prerequisites
 
 - Python 3.10+
-- [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli) installed and authenticated (`az login`)
-- The `datafactory` Azure CLI extension: `az extension add --name datafactory`
+- [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli) installed and authenticated (`az login`) - this is used by `DefaultAzureCredential` for local auth
 - An Azure subscription with an existing ADF instance
-- [Claude Desktop](https://claude.ai/download) (or another MCP-compatible client)
+- [Claude Desktop](https://claude.ai/download) or another MCP-compatible tool
 
 ### Installation
 
@@ -120,7 +107,7 @@ Add the following to `claude_desktop_config.json` (typically `%APPDATA%\Claude\c
 }
 ```
 
-Fully quit and relaunch Claude Desktop after saving — check the system tray to make sure the old instance is gone. The ADF tools will appear in Claude's tool list once the server starts successfully.
+Fully quit and relaunch Claude Desktop after saving and check the system tray to make sure the old instance is gone. The ADF tools will appear in Claude's tool list once the server starts successfully.
 
 ### Verifying the server
 
@@ -138,29 +125,28 @@ You should see two JSON-RPC responses: an `initialize` result and then the `list
 
 **Current scope**
 - Designed as a local developer tool for a single authenticated user, not a production deployment
-- Authentication is delegated entirely to `az login` — there is no support for service principals, managed identities, or multi-user access control
-- The `az datafactory` CLI has no native upsert for pipelines, linked services, or datasets: updates are implemented as delete + recreate, which means there is a brief window where the resource does not exist. This is fine for development but not for live production pipelines
-- Trigger management (creating, enabling, disabling schedules or event-based triggers) is not yet implemented
+- Create/update tools accept an absolute file path and read it under the server process's own OS permissions, so only trusted MCP clients should connect to the server
+- Trigger management (creating, enabling, disabling schedule or event-based triggers) is not yet implemented
 - No support for ADF integration runtimes, credentials objects, or private endpoint configuration
 
 **Potential future directions**
-- Authentication via service principal or managed identity for deployment in shared or CI/CD environments
 - Support for ADF triggers to enable autonomous scheduling workflows
 - Integration with Git-backed ADF to commit generated artifacts directly to a repository branch
 - Enterprise hardening: audit logging of all tool calls, rate limiting, and scoped read-only vs. read-write access modes
-- Broader Azure data platform coverage — Synapse Analytics, Azure Databricks, or Azure SQL as first-class targets
+- Broader Azure data platform coverage. Synapse Analytics, Azure Databricks, or Azure SQL are potential candidates.
 
 
 ## Tech Stack
 
-- **Python 3.10+** — asyncio for non-blocking subprocess execution
+- **Python 3.10+** — asyncio for non-blocking SDK execution
 - **[MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk)** (`mcp>=1.26.0`) — server framework and stdio transport
-- **Azure CLI** (`az`) with the `datafactory` extension — all ADF operations are delegated to the CLI rather than calling the REST API directly
+- **`azure-mgmt-datafactory`** — Azure Data Factory management SDK
+- **`azure-identity`** — `DefaultAzureCredential` for ambient authentication
 - **Azure Data Factory** — target platform for all resource management and pipeline execution
 
 
 ## About
 
-Brief context on why you built this — one or two sentences. Something like: "Built as an exploration of how MCP can bridge AI assistants and enterprise data platforms. Part of a broader interest in the intersection of data engineering and AI tooling."
+Built to demonstrate how MCP can bridge AI assistants and enterprise data platforms. Part of a broader interest in the intersection of data engineering and AI tooling.
 
-Link to your LinkedIn if you want.
+[LinkedIn](https://www.linkedin.com/in/peter-duebel/)

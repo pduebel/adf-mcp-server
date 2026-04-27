@@ -289,7 +289,17 @@ async def _list_dataflows(_args: dict) -> dict:
     return await _list_adf_resources(_get_client().data_flows.list_by_factory, "data flows", "list_dataflows")
 
 
-# ── Tool 12: create_or_update_dataflow ───────────────────────────────────────
+# ── Tool 12: get_dataflow ────────────────────────────────────────────────────
+
+async def _get_dataflow(args: dict) -> dict:
+    return await _get_adf_resource(
+        _get_client().data_flows.get,
+        args.get("dataflow_name", "").strip(),
+        "dataflow_name", "data flow", "get_dataflow",
+    )
+
+
+# ── Tool 13: create_or_update_dataflow ───────────────────────────────────────
 
 async def _create_or_update_dataflow(args: dict) -> dict:
     if err := _check_config():
@@ -705,6 +715,17 @@ async def handle_list_tools() -> list[types.Tool]:
             inputSchema={"type": "object", "properties": {}},
         ),
         types.Tool(
+            name="get_dataflow",
+            description="Get the full JSON definition of a single ADF data flow by name.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "dataflow_name": {"type": "string", "description": "Name of the data flow to retrieve."},
+                },
+                "required": ["dataflow_name"],
+            },
+        ),
+        types.Tool(
             name="create_or_update_dataflow",
             description=(
                 "Create or update an Azure Data Factory data flow. "
@@ -850,6 +871,7 @@ async def handle_call_tool(
         "delete_linked_service": _delete_linked_service,
         "delete_dataset": _delete_dataset,
         "list_dataflows": _list_dataflows,
+        "get_dataflow": _get_dataflow,
         "create_or_update_dataflow": _create_or_update_dataflow,
         "delete_dataflow": _delete_dataflow,
         "trigger_pipeline_run": _trigger_pipeline_run,
