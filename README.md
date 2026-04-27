@@ -70,8 +70,8 @@ The AI tool launches it as a child process and communicates over stdin/stdout us
 ### Installation
 
 ```bash
-git clone https://github.com/your-username/data-factory-agent.git
-cd data-factory-agent
+git clone https://github.com/pduebel/adf-mcp-server.git
+cd adf-mcp-server
 pip install -r requirements.txt
 ```
 
@@ -96,7 +96,7 @@ Add the following to `claude_desktop_config.json` (typically `%APPDATA%\Claude\c
   "mcpServers": {
     "adf": {
       "command": "python",
-      "args": ["C:\\path\\to\\data-factory-agent\\adf_mcp_server.py"],
+      "args": ["C:\\path\\to\\adf-mcp-server\\adf_mcp_server.py"],
       "env": {
         "ADF_SUBSCRIPTION_ID": "<your-subscription-id>",
         "ADF_RESOURCE_GROUP": "<your-resource-group>",
