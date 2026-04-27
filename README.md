@@ -109,18 +109,6 @@ Add the following to `claude_desktop_config.json` (typically `%APPDATA%\Claude\c
 
 Fully quit and relaunch Claude Desktop after saving and check the system tray to make sure the old instance is gone. The ADF tools will appear in Claude's tool list once the server starts successfully.
 
-### Verifying the server
-
-To confirm the server responds correctly before connecting Claude Desktop, pipe a minimal MCP exchange to it directly:
-
-```bash
-printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_pipelines","arguments":{}}}\n' \
-  | ADF_SUBSCRIPTION_ID=... ADF_RESOURCE_GROUP=... ADF_FACTORY_NAME=... python adf_mcp_server.py
-```
-
-You should see two JSON-RPC responses: an `initialize` result and then the `list_pipelines` result. If the tool response is missing, check stderr for errors.
-
-
 ## Limitations & Future Work
 
 **Current scope**
